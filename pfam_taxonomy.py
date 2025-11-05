@@ -126,36 +126,61 @@ def _iter_pfam_proteins_with_taxa(pfam_id: str,
                     continue
 
 
-def _ranks_for_taxids(tax_ids: List[int], ranks: List[str]) -> pd.DataFrame:
+def _ranks_for_taxids(tax_ids: list[int], ranks: list[str]) -> pd.DataFrame:
+    """
+    Map each tax_id to requested ranks.
+    Special-case 'superkingdom' to handle taxonomy snapshots that mark it as 'domain'
+    or leave it unranked. Fallback uses canonical top-level taxids.
+    """
+    # canonical top-level nodes
+    TOP = {
+        2: "Bacteria",
+        2157: "Archaea",
+        2759: "Eukaryota",
+        10239: "Viruses",
+        # add more if you care: 12884 "Viroids", etc.
+    }
+
     uniq = sorted(set(tax_ids))
-    n = len(uniq)
-    _log(f"[ncbi] unique_taxids={n} computing ranked labels")
     rows = {}
-    last_log = time.time()
-    for i, tid in enumerate(uniq, 1):
+
+    for tid in uniq:
         try:
-            lin = ncbi.get_lineage(tid)
-            rmap = ncbi.get_rank(lin)
-            nmap = ncbi.get_taxid_translator(lin)
+            lin = ncbi.get_lineage(tid)                   # list of taxids (root -> tid)
+            rmap = ncbi.get_rank(lin)                     # taxid -> rank str
+            nmap = ncbi.get_taxid_translator(lin)         # taxid -> name
+
+            # fill all requested ranks in order
             row = {r: "" for r in ranks}
             for t in lin:
                 r = rmap.get(t)
                 if r in row and not row[r]:
                     row[r] = nmap.get(t, "")
+
+            # robust superkingdom:
+            if "superkingdom" in row and not row["superkingdom"]:
+                # try 'domain' label if present in this snapshot
+                dom = next((nmap.get(t, "") for t in lin if rmap.get(t) == "domain"), "")
+                if dom:
+                    row["superkingdom"] = dom
+                else:
+                    # infer from canonical top-level nodes
+                    for t in lin:
+                        if t in TOP:
+                            row["superkingdom"] = TOP[t]
+                            break
+
             rows[tid] = row
         except Exception:
             rows[tid] = {r: "" for r in ranks}
-        # heartbeat every ~2s
-        now = time.time()
-        if now - last_log >= 2.0 or i == n:
-            _log(f"[ncbi] {i}/{n} ({100.0*i/n:.1f}%)")
-            last_log = now
 
-    return (
+    df = (
         pd.DataFrame.from_dict(rows, orient="index")
         .rename_axis("tax_id")
         .reset_index()
     )
+    # ensure column order is exactly: tax_id + ranks
+    return df[["tax_id", *ranks]]
 
 
 def pfam_taxonomy_table(pfam_id: str,
@@ -187,7 +212,12 @@ def pfam_taxonomy_table(pfam_id: str,
     tax_df = _ranks_for_taxids(seq_df["tax_id"].tolist(), ranks=ranks)
 
     out = seq_df.merge(tax_df, on="tax_id", how="left")
+    # Fallback for species
     out["species"] = out["species"].mask(out["species"] == "", out["organism"])
+    # Make sure superkingdom is 4th column
+    final_cols = ["accession", "tax_id", "organism", *RANKS]
+    out = out.reindex(columns=final_cols)
+
     return out
 
 
